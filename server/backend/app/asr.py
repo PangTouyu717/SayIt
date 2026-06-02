@@ -61,7 +61,7 @@ class ASREngine:
                 self._model = Qwen3ASRModel.LLM(
                     model=config.asr.model,
                     gpu_memory_utilization=config.asr.vllm_gpu_util,
-                    max_new_tokens=512,
+                    max_new_tokens=2048,
                     max_model_len=config.asr.vllm_max_model_len,
                 )
                 self._backend = "vllm"
@@ -70,7 +70,7 @@ class ASREngine:
                 import torch
                 self._model = Qwen3ASRModel.from_pretrained(
                     config.asr.model, dtype=torch.bfloat16,
-                    device_map=config.asr.device, max_new_tokens=512,
+                    device_map=config.asr.device, max_new_tokens=2048,
                 )
                 self._backend = "transformers"
             logger.info("Qwen3-ASR ready (%s)", self._backend)
@@ -235,15 +235,16 @@ class ASREngine:
                 job_text_parts[idx] = []
                 continue
 
-            if duration <= 120.0:
-                # ≤ 2min: send whole audio, no split — accuracy first.
-                # VAD-based filtering was removed because it aggressively
-                # discards whispered speech (low-energy audio misclassified
-                # as silence), causing severe recognition loss.
+            if duration <= 60.0:
+                # ≤ 1min: send whole audio, no split — accuracy first.
                 segs = [(audio, duration)]
             else:
-                # > 2min: safe split at ≥3s silence gaps
+                # > 1min: safe split at silence gaps
                 segs = self._safe_split(audio)
+                # Merge segments with very low speech ratio into adjacent segments
+                # to avoid batch inference failure from near-silent segments.
+                if len(segs) > 1:
+                    segs = self._merge_silent_segments(segs)
                 logger.info("Safe split %.1fs -> %d segs %s",
                             duration, len(segs), [f"{d:.1f}s" for _, d in segs])
             job_vad_ms[idx] = int((time.monotonic() - vad_t0) * 1000)
@@ -408,7 +409,55 @@ class ASREngine:
             logger.exception("VAD failed")
             return [(audio, len(audio) / 16000.0)] if fallback_to_full else []
 
-    def _safe_split(self, audio: np.ndarray, min_gap: float = 3.0, min_seg: float = 15.0, max_seg: float = 240.0) -> list[tuple[np.ndarray, float]]:
+    def _merge_silent_segments(self, segs: list[tuple[np.ndarray, float]], min_speech_ratio: float = 0.15) -> list[tuple[np.ndarray, float]]:
+        """Merge segments with very low speech ratio into adjacent segments.
+
+        Near-silent segments in a batch can cause vLLM to return empty results
+        for the entire batch. Merging them into neighbors avoids this while
+        preserving any speech content they may contain.
+        """
+        if not self._vad or len(segs) <= 1:
+            return segs
+        import torch
+        # Identify which segments have low speech ratio
+        speech_ok = []
+        for seg_audio, seg_dur in segs:
+            try:
+                res = self._vad.generate(input=torch.tensor(seg_audio, dtype=torch.float32), cache={}, is_final=True)
+                vad_segs = res[0].get("value", []) if res else []
+                speech_time = sum((e - s) for s, e in vad_segs) / 1000.0 if vad_segs else 0
+                speech_ok.append(speech_time / seg_dur >= min_speech_ratio if seg_dur > 0 else True)
+            except Exception:
+                speech_ok.append(True)  # on error, assume it's fine
+
+        if all(speech_ok):
+            return segs
+
+        # Merge low-speech segments into adjacent (prefer previous, fallback to next)
+        merged: list[tuple[np.ndarray, float]] = []
+        i = 0
+        while i < len(segs):
+            if speech_ok[i]:
+                merged.append(segs[i])
+                i += 1
+            else:
+                # Merge into previous segment if available, otherwise next
+                if merged:
+                    prev_audio, prev_dur = merged[-1]
+                    cur_audio, cur_dur = segs[i]
+                    merged[-1] = (np.concatenate([prev_audio, cur_audio]), prev_dur + cur_dur)
+                elif i + 1 < len(segs):
+                    cur_audio, cur_dur = segs[i]
+                    nxt_audio, nxt_dur = segs[i + 1]
+                    merged.append((np.concatenate([cur_audio, nxt_audio]), cur_dur + nxt_dur))
+                    speech_ok[i + 1] = True  # skip next since we consumed it
+                    i += 1
+                else:
+                    merged.append(segs[i])
+                i += 1
+        return merged
+
+    def _safe_split(self, audio: np.ndarray, min_gap: float = 1.0, min_seg: float = 10.0, max_seg: float = 100.0) -> list[tuple[np.ndarray, float]]:
         """Split audio at long silence gaps (≥ min_gap seconds), keeping ALL audio.
 
         Unlike _vad_split which discards silence, this preserves the full audio
@@ -443,7 +492,41 @@ class ASREngine:
                 if all(d >= min_seg for d in seg_durs) and all(d <= max_seg for d in seg_durs):
                     cuts.append(mid)
 
-            if not cuts:
+            if not cuts and dur > 100.0:
+                # Fallback: force split at lowest energy point near ideal boundaries
+                ideal_seg = 60.0  # target segment length
+                n_cuts_needed = max(1, int(dur / ideal_seg) - 1)
+                frame_len = int(0.05 * 16000)  # 50ms frames
+                hop = frame_len // 2
+                n_frames = (len(audio) - frame_len) // hop
+                if n_frames > 0:
+                    energy = np.array([np.sum(audio[i*hop:i*hop+frame_len]**2) for i in range(n_frames)])
+                    # Smooth energy
+                    kernel = np.ones(20) / 20
+                    if len(energy) > len(kernel):
+                        energy = np.convolve(energy, kernel, mode='same')
+                    forced_cuts = []
+                    for c in range(1, n_cuts_needed + 1):
+                        target_time = dur * c / (n_cuts_needed + 1)
+                        # Search window: +/- 10s around target
+                        win_start = max(0, int((target_time - 10) * 16000 / hop))
+                        win_end = min(n_frames, int((target_time + 10) * 16000 / hop))
+                        if win_start < win_end:
+                            min_idx = win_start + np.argmin(energy[win_start:win_end])
+                            cut_time = min_idx * hop / 16000.0
+                            forced_cuts.append(cut_time)
+                    if forced_cuts:
+                        forced_cuts.sort()
+                        points = [0.0] + forced_cuts + [dur]
+                        segments = []
+                        for i in range(len(points) - 1):
+                            s, e = int(points[i]*16000), int(points[i+1]*16000)
+                            seg = audio[s:e]
+                            segments.append((seg, len(seg)/16000.0))
+                        logger.info("Energy fallback split %.1fs -> %d segs %s", dur, len(segments), [f"{d:.1f}s" for _,d in segments])
+                        return segments
+                return [(audio, dur)]
+            elif not cuts:
                 return [(audio, dur)]
 
             cuts.sort()
@@ -467,7 +550,7 @@ class ASREngine:
         debug = {"duration_sec": round(duration, 1), "vad_segments": [], "context": ctx}
 
         if self._engine_type == "firered":
-            if duration <= 15.0:
+            if duration <= 120.0:
                 debug["vad_segments"] = [{"index": 0, "duration_sec": round(duration, 1)}]
                 return self._firered_backend.transcribe_audio(audio), debug
             segments = self._vad_split(audio)

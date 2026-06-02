@@ -1,12 +1,12 @@
 // 外观设置页面 — 主题 + 悬浮窗样式 + 预览
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { themeList } from '@/themes'
 import { switchTheme, getActiveThemeId } from '@/stores/theme'
 import { getSetting, setSetting } from '@/services/store'
-import { refreshRecorderSettings } from '@/services/recorder'
+import { refreshOverlaySettings } from '@/services/recorder'
 import { OVERLAY_WIDTH_PRESETS, type OverlayWidthPreset } from '@/services/recorder/types'
 import { type OverlayWaveTheme } from './utils'
 
@@ -46,26 +46,37 @@ function getTimerColor(theme: OverlayWaveTheme): string {
 }
 
 function OverlayPreview({ theme, showDuration, barCount }: { theme: OverlayWaveTheme; showDuration: boolean; barCount: number }) {
-  const [bars, setBars] = useState<number[]>(Array.from({ length: barCount }, () => 3))
+  const barRefs = useRef<Array<HTMLDivElement | null>>([])
 
   useEffect(() => {
-    setBars(Array.from({ length: barCount }, () => 3))
-  }, [barCount])
-
-  useEffect(() => {
+    const heights = new Array(barCount).fill(3)
     let running = true
-    const animate = () => {
+    let rafId = 0
+    let lastFrame = 0
+    const FRAME_INTERVAL = 1000 / 30 // 30fps 足够流畅，且不占满主线程
+
+    const animate = (now: number) => {
       if (!running) return
-      setBars((prev) =>
-        prev.map((v) => {
+      if (now - lastFrame >= FRAME_INTERVAL) {
+        lastFrame = now
+        for (let i = 0; i < heights.length; i++) {
           const target = 3 + Math.random() * 15
-          return v + (target - v) * 0.15
-        }),
-      )
-      requestAnimationFrame(animate)
+          heights[i] = heights[i] + (target - heights[i]) * 0.15
+          const el = barRefs.current[i]
+          if (el) {
+            const h = Math.min(18, Math.max(3, heights[i]))
+            el.style.height = `${h}px`
+            el.style.opacity = String(0.7 + (h / 18) * 0.3)
+          }
+        }
+      }
+      rafId = requestAnimationFrame(animate)
     }
-    requestAnimationFrame(animate)
-    return () => { running = false }
+    rafId = requestAnimationFrame(animate)
+    return () => {
+      running = false
+      cancelAnimationFrame(rafId)
+    }
   }, [barCount])
 
   return (
@@ -73,17 +84,17 @@ function OverlayPreview({ theme, showDuration, barCount }: { theme: OverlayWaveT
       {/* 1:1 还原真实悬浮窗样式 */}
       <div className="flex items-center rounded-full border border-slate-600 bg-black px-4 py-2 shadow-[0_6px_16px_rgba(0,0,0,0.35)]">
         <div className="flex items-center gap-[2px]" style={{ height: '20px' }}>
-          {bars.map((height, index) => {
-            const h = Math.min(18, Math.max(3, height))
-            const color = getBarColor(index, bars.length, theme)
+          {Array.from({ length: barCount }, (_, index) => {
+            const color = getBarColor(index, barCount, theme)
             return (
               <div
                 key={index}
+                ref={(el) => { barRefs.current[index] = el }}
                 className="w-[2.5px] rounded-full"
                 style={{
                   backgroundColor: color,
-                  height: `${h}px`,
-                  opacity: 0.7 + (h / 18) * 0.3,
+                  height: '3px',
+                  opacity: 0.7,
                   transition: 'height 50ms ease-out, opacity 50ms ease-out',
                 }}
               />
@@ -130,20 +141,20 @@ export default function AppearancePage() {
   const handleOverlayThemeChange = async (theme: OverlayWaveTheme) => {
     setOverlayWaveTheme(theme)
     await setSetting('overlayWaveTheme', theme)
-    await refreshRecorderSettings()
+    await refreshOverlaySettings()
   }
 
   const handleToggleDuration = async () => {
     const next = !overlayShowDuration
     setOverlayShowDuration(next)
     await setSetting('overlayShowDuration', next)
-    await refreshRecorderSettings()
+    await refreshOverlaySettings()
   }
 
   const handleOverlayWidthChange = async (preset: OverlayWidthPreset) => {
     setOverlayWidth(preset)
     await setSetting('overlayWidth', preset)
-    await refreshRecorderSettings()
+    await refreshOverlaySettings()
   }
 
   return (

@@ -28,16 +28,31 @@ export function close() {
 
 // ─── Overlay ───
 
+/**
+ * Bug 003 diagnostic helper — log overlay IPC failures to runtime events
+ * (which mirror to sayit.log via appendDebugLog).
+ */
+function logOverlayIpcError(op: string, err: unknown) {
+  try {
+    // Lazy import to avoid circular dep with debugLog
+    void import('./debugLog').then(({ addRuntimeEvent }) => {
+      addRuntimeEvent('error', 'overlay-ipc', `${op} failed`, { error: String(err) })
+    })
+  } catch {
+    console.error(`[overlay-ipc] ${op} failed:`, err)
+  }
+}
+
 export function showOverlay() {
-  invoke('show_overlay')
+  invoke('show_overlay').catch((err) => logOverlayIpcError('show_overlay', err))
 }
 
 export function hideOverlay() {
-  invoke('hide_overlay')
+  invoke('hide_overlay').catch((err) => logOverlayIpcError('hide_overlay', err))
 }
 
 export function updateOverlay(data: unknown) {
-  invoke('update_overlay_state', { data })
+  invoke('update_overlay_state', { data }).catch((err) => logOverlayIpcError('update_overlay_state', err))
 }
 
 // ─── Paste / Context ───

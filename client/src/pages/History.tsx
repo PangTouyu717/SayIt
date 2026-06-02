@@ -21,8 +21,17 @@ import {
 import { loadAudioAsDataUrl } from '@/services/audioFileService'
 import { segmentAsrText } from '@/services/textSegmenter'
 import { applyTextReplacements } from '@/services/textReplacement'
-import { getProvider } from '@/services/transcription'
-import { reconnectProvider } from '@/services/recorder'
+import {
+  BUILTIN_SET_WORDS_KEY,
+  BUILTIN_SET_ACTIVE_KEY,
+  CUSTOM_THEMES_KEY,
+  CUSTOM_THEME_ACTIVE_KEY,
+  composeHotwords,
+  normalizeBuiltinSetActive,
+  normalizeBuiltinSetWords,
+  normalizeCustomThemeActive,
+  normalizeCustomThemes,
+} from '@/services/hotwords/model'
 
 const HISTORY_PAGE_SIZE = 100
 
@@ -102,50 +111,146 @@ export default function History() {
     const pcmData = bytes.slice(44)
     const chunk = pcmData.buffer.slice(pcmData.byteOffset, pcmData.byteOffset + pcmData.byteLength)
 
+    // Diagnostic: compute peak amplitude of the PCM data being sent
+    const pcmInt16 = new Int16Array(chunk)
+    let reprocessPeak = 0
+    for (let i = 0; i < pcmInt16.length; i++) {
+      const v = Math.abs(pcmInt16[i])
+      if (v > reprocessPeak) reprocessPeak = v
+    }
+    const reprocessPeakNorm = reprocessPeak / 32768
+    const reprocessDurSec = pcmInt16.length / 16000
+    console.log('[reprocess-diag] PCM stats', {
+      byteLength: chunk.byteLength,
+      samples: pcmInt16.length,
+      durationSec: reprocessDurSec.toFixed(2),
+      peakInt16: reprocessPeak,
+      peakNormalized: reprocessPeakNorm.toFixed(4),
+      wouldBeSilent: reprocessPeakNorm < 0.01,
+    })
+
     const preset = await getActivePreset()
     const aiEnabled = await getSetting('aiEnabled', false)
 
-    // 使用当前 Provider 重新识别
-    const provider = getProvider()
-    let reprocessDone = false
+    // 加载热词
+    let hotwords: string[] = []
+    try {
+      const [rawSetWords, rawSetActive, rawCustomThemes, rawCustomThemeActive] = await Promise.all([
+        getSetting(BUILTIN_SET_WORDS_KEY, {}),
+        getSetting(BUILTIN_SET_ACTIVE_KEY, {}),
+        getSetting(CUSTOM_THEMES_KEY, []),
+        getSetting(CUSTOM_THEME_ACTIVE_KEY, {}),
+      ])
+      const setWords = normalizeBuiltinSetWords(rawSetWords as Record<string, unknown>)
+      const setActive = normalizeBuiltinSetActive(rawSetActive as Record<string, unknown>)
+      const themes = normalizeCustomThemes(rawCustomThemes)
+      const themeActive = normalizeCustomThemeActive(rawCustomThemeActive as Record<string, unknown>, themes)
+      hotwords = composeHotwords([], setWords, setActive, themes, themeActive)
+    } catch { /* ignore */ }
+
+    const clientMeta = await bridge.getClientRuntimeInfo().catch(() => null)
+
+    // 使用独立的 WebSocket 连接进行重新识别，避免干扰 RecorderOrchestrator 的全局连接。
+    const { getWSUrl } = await import('@/services/runtimeConfig')
+    const wsUrl = getWSUrl()
+
     const result = await new Promise<{ asrText: string; llmText: string; asrMs: number; llmMs: number; durationSec: number; asrEngine?: string; asrModel?: string }>((resolve, reject) => {
       const timeout = window.setTimeout(() => {
-        if (!reprocessDone) { reprocessDone = true; provider.disconnect() }
-        reconnectProvider()
+        try { socket.close() } catch { /* ignore */ }
         reject(new Error('重新识别超时'))
-      }, 60000)
+      }, 30_000) // ASR 最多 30 秒
 
-      void provider.connect({
-        onFinal: (r) => {
-          clearTimeout(timeout)
-          reprocessDone = true
-          provider.disconnect()
-          reconnectProvider()
-          resolve(r)
-        },
-        onError: (msg) => {
-          clearTimeout(timeout)
-          if (!reprocessDone) { reprocessDone = true; provider.disconnect() }
-          reconnectProvider()
-          reject(new Error(msg))
-        },
-        onDone: () => {
-          // 如果没有 final 就 done 了，说明没有结果
-        },
-      }).then(async () => {
-        const clientMeta = await bridge.getClientRuntimeInfo().catch(() => null)
-        provider.start({
-          systemPrompt: aiEnabled ? preset.systemPrompt : undefined,
-          disableAi: !aiEnabled,
-          clientMeta,
+      const socket = new WebSocket(wsUrl)
+      socket.binaryType = 'arraybuffer'
+
+      let resolved = false
+
+      socket.onopen = () => {
+        // 发送 start
+        const startMsg: Record<string, unknown> = {
+          cmd: 'start',
           source: 'history_reprocess',
-        })
-        provider.sendAudio(chunk)
-        provider.stop()
-      }).catch((err) => {
-        clearTimeout(timeout)
-        reject(err)
-      })
+          disable_ai: !aiEnabled,
+        }
+        if (aiEnabled && preset.systemPrompt) startMsg.system_prompt = preset.systemPrompt
+        if (clientMeta) {
+          startMsg.client_meta = {
+            user_id: clientMeta.userId,
+            device_id: clientMeta.deviceId,
+            hostname: clientMeta.hostname,
+            client_version: clientMeta.clientVersion,
+            platform: clientMeta.platform,
+            os_version: clientMeta.osVersion,
+            local_ip: clientMeta.localIp,
+            system_locale: clientMeta.systemLocale,
+            cpu_cores: clientMeta.cpuCores,
+            memory_mb: clientMeta.memoryMb,
+          }
+        }
+        if (hotwords.length > 0) startMsg.hotwords = hotwords
+        socket.send(JSON.stringify(startMsg))
+
+        // 分片发送 PCM 数据
+        const CHUNK_SIZE = 32000
+        const totalBytes = chunk.byteLength
+        for (let offset = 0; offset < totalBytes; offset += CHUNK_SIZE) {
+          const end = Math.min(offset + CHUNK_SIZE, totalBytes)
+          socket.send(chunk.slice(offset, end))
+        }
+
+        // 发送 stop
+        socket.send(JSON.stringify({ cmd: 'stop' }))
+      }
+
+      socket.onmessage = (ev) => {
+        if (typeof ev.data !== 'string') return
+        try {
+          const msg = JSON.parse(ev.data)
+          console.log('[reprocess-diag] ws message:', msg.type, msg)
+          if (msg.type === 'final') {
+            resolved = true
+            clearTimeout(timeout)
+            socket.close()
+            resolve({
+              asrText: msg.asr_text || '',
+              llmText: msg.llm_text || '',
+              asrMs: msg.asr_ms || 0,
+              llmMs: msg.llm_ms || 0,
+              durationSec: Number(msg.duration_sec || 0),
+              asrEngine: msg.asr_engine || undefined,
+              asrModel: msg.asr_model || undefined,
+            })
+          } else if (msg.type === 'done' && !resolved) {
+            // 没有 final 就 done 了（后端判定为静音/无结果）
+            resolved = true
+            clearTimeout(timeout)
+            socket.close()
+            resolve({ asrText: '', llmText: '', asrMs: 0, llmMs: 0, durationSec: 0 })
+          } else if (msg.type === 'error') {
+            resolved = true
+            clearTimeout(timeout)
+            socket.close()
+            reject(new Error(msg.message || 'backend error'))
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      socket.onerror = () => {
+        if (!resolved) {
+          resolved = true
+          clearTimeout(timeout)
+          reject(new Error('WebSocket 连接错误'))
+        }
+      }
+
+      socket.onclose = (ev) => {
+        console.log('[reprocess-diag] ws closed', { code: ev.code, reason: ev.reason, resolved })
+        if (!resolved) {
+          resolved = true
+          clearTimeout(timeout)
+          reject(new Error(`WebSocket 连接意外关闭 code=${ev.code}`))
+        }
+      }
     })
 
     // 极速模式下 llmText === asrText（后端未经 LLM 处理时直接复制 asrText）
@@ -161,14 +266,10 @@ export default function History() {
       llmMs: result.llmMs,
       charCount: (result.llmText || result.asrText).length,
       isEmpty: !(result.llmText || result.asrText).trim(),
-      workMode: provider.mode,
-      aiProvider: provider.mode === 'server' ? 'server' : undefined,
-      aiModel: provider.mode === 'server' ? undefined : undefined,
-      asrProvider: provider.mode === 'local'
-        ? String(await getSetting('localAsr.modelId', 'sensevoice-small'))
-        : provider.mode === 'cloud_api'
-          ? resolveAsrDisplayModel(String(await getSetting('cloudAsr.provider', '')))
-          : (result.asrModel || result.asrEngine || 'server').replace(/^.*\//, ''),
+      workMode: 'server',
+      aiProvider: 'server',
+      aiModel: undefined,
+      asrProvider: (result.asrModel || result.asrEngine || 'server').replace(/^.*\//, ''),
     })
 
     void loadRecords(debouncedKeyword, visibleCount, favoriteOnly)

@@ -23,3 +23,10 @@ pub async fn update_overlay_state(data: Value, app: AppHandle, window_state: Sta
     window_state.update_overlay_state(&app, &data);
     Ok(())
 }
+
+/// Reported by the overlay webview in response to an `overlay-ping` event.
+/// Used to detect WebView2 unresponsiveness.
+#[tauri::command]
+pub fn overlay_pong(seq: u64) {
+    crate::window::record_overlay_pong(seq);
+}

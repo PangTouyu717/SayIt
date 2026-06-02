@@ -33,6 +33,11 @@ export async function refreshRecorderSettings() {
   await orchestrator.refreshRuntimeSettings()
 }
 
+/** 仅刷新 overlay 显示设置（主题/长度/时长）— 轻量，避免触发全量录音缓存刷新 */
+export async function refreshOverlaySettings() {
+  await orchestrator.refreshOverlaySettings()
+}
+
 /** 工作模式切换后重新连接 */
 export function reconnectProvider() {
   orchestrator.reconnectProvider()

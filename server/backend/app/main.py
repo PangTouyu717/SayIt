@@ -220,15 +220,15 @@ def _is_hotword_hallucination(text: str, context: str, audio_peak: float = 1.0,
                               audio_dur: float = 0.0, voice_score: float = 1.0) -> bool:
     if not context or not text:
         return False
-    words = set(context.split())
+    words = set(w.lower() for w in context.split())
     cleaned = re.sub(r"[\s銆傦紝銆侊紵锛?,?!\u3000。]+", " ", text).strip()
     tokens = cleaned.split()
     if not tokens:
         return False
-    matched = sum(1 for token in tokens if token in words)
+    matched = sum(1 for token in tokens if token.lower() in words)
     consec = max_consec = 0
     for token in tokens:
-        if token in words:
+        if token.lower() in words:
             consec += 1
             max_consec = max(max_consec, consec)
         else:
@@ -239,7 +239,7 @@ def _is_hotword_hallucination(text: str, context: str, audio_peak: float = 1.0,
         return True
     # Short result composed entirely of hotwords → almost certainly hallucination.
     # Real users don't speak just a single hotword and stop.
-    if len(cleaned) <= 6 and all(t in words for t in tokens):
+    if len(cleaned) <= 6 and all(t.lower() in words for t in tokens):
         return True
     return False
 
@@ -372,17 +372,40 @@ async def _run_asr_llm(
 
     # Strip hotword context when audio has no detectable speech energy,
     # preventing the ASR model from hallucinating hotwords on noise.
-    # Whispered speech has voice_score > 0.50; noise/silence < 0.15.
+    # Three-layer detection: voice_score, energy level, and VAD.
     audio_peak = float(np.max(np.abs(audio)))
+    audio_rms = float(np.sqrt(np.mean(audio**2)))
     vs = _voice_score(audio)
-    if vs < _VS_THRESHOLD and (context is None or context):
-        logger.info("Stripping hotword context: voice_score=%.3f peak=%.4f", vs, audio_peak)
+    strip_context = False
+    if vs < _VS_THRESHOLD or (audio_peak < 0.02 and audio_rms < 0.002):
+        strip_context = True
+    elif context and duration < 10.0 and asr_engine and asr_engine._vad is not None:
+        # For short audio with hotwords: use VAD to detect if there's actual speech.
+        # This catches non-speech noise (keyboard, clicks) that has high energy.
+        import torch
+        try:
+            vad_res = asr_engine._vad.generate(
+                input=torch.tensor(audio, dtype=torch.float32), cache={}, is_final=True)
+            vad_segs = vad_res[0].get("value", []) if vad_res else []
+            logger.debug("VAD check: segs=%d, duration=%.1f", len(vad_segs), duration)
+            if not vad_segs:
+                strip_context = True
+        except Exception as e:
+            logger.warning("VAD check failed: %s", e)
+    if strip_context and (context is None or context):
+        logger.info("Stripping hotword context: voice_score=%.3f peak=%.4f rms=%.5f", vs, audio_peak, audio_rms)
         context = ""
 
     raw_text, asr_ms, asr_debug = await asr_engine.transcribe(audio, context=context, language=language)
     asr_text = _clean_text(raw_text)
     asr_debug["voice_score"] = round(vs, 3)
     if _is_noise(asr_text, duration, voice_score=vs) or _is_hotword_hallucination(asr_text, asr_debug.get("context", ""), audio_peak=audio_peak, audio_dur=duration, voice_score=vs):
+        asr_text = ""
+    # Low energy audio producing short text is almost certainly noise/hallucination
+    if asr_text and audio_peak < 0.02 and audio_rms < 0.002 and len(asr_text) <= 10:
+        asr_text = ""
+    # VAD detected no speech but ASR produced short text → noise hallucination
+    if asr_text and strip_context and len(asr_text) <= 10:
         asr_text = ""
 
     if cfg.logging.slow_asr_ms and asr_ms >= cfg.logging.slow_asr_ms:

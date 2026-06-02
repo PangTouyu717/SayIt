@@ -44,6 +44,9 @@ const PTT_LAB_VK = 0xA3
 let pttCode = ''
 let pttSetting = ''
 let pttKeyDown = false
+let hfCode = ''
+let hfSetting = ''
+let hfKeyDown = false
 let labKeyDown = false
 let labEnabled = false
 let started = false
@@ -72,6 +75,15 @@ function handleKeyDown(e: KeyboardEvent) {
       ctrlKey: pttSetting === 'ControlLeft' || pttSetting === 'ControlRight',
       shiftKey: pttSetting === 'ShiftLeft' || pttSetting === 'ShiftRight',
     })
+    return
+  }
+
+  // 免提键（HF）：在 keydown 时阻止默认行为，keyup 时触发 toggle
+  if (hfCode && e.code === hfCode && pttCode !== hfCode) {
+    hfKeyDown = true
+    if (isModifierSetting(hfSetting)) {
+      e.preventDefault()
+    }
     return
   }
 
@@ -112,6 +124,20 @@ function handleKeyUp(e: KeyboardEvent) {
     return
   }
 
+  // 免提键：keyup 时 emit toggle-hands-free
+  if (hfCode && e.code === hfCode && hfKeyDown && pttCode !== hfCode) {
+    hfKeyDown = false
+    if (isModifierSetting(hfSetting)) {
+      e.preventDefault()
+    }
+    console.log('[webview-kb] toggle-hands-free (webview fallback)', { code: e.code, hfSetting })
+    emit('toggle-hands-free', {
+      source: 'webview_fallback',
+      vk: SETTING_TO_VK[hfSetting] || 0,
+    })
+    return
+  }
+
   // PTT Lab 键
   if (labEnabled && e.code === PTT_LAB_CODE && labKeyDown) {
     if (pttCode === PTT_LAB_CODE) return
@@ -137,7 +163,18 @@ export async function refreshPTTSetting() {
   }
   pttCode = SETTING_TO_CODE[pttSetting] || ''
   pttKeyDown = false
+
+  try {
+    const hfSettingVal = await getSetting('shortcutHandsFree', 'AltRight')
+    hfSetting = String(hfSettingVal || 'AltRight')
+  } catch {
+    hfSetting = 'AltRight'
+  }
+  hfCode = SETTING_TO_CODE[hfSetting] || ''
+  hfKeyDown = false
+
   console.log('[webview-kb] PTT setting refreshed:', pttSetting, '→ code:', pttCode)
+  console.log('[webview-kb] HF setting refreshed:', hfSetting, '→ code:', hfCode)
 }
 
 /** PTT Lab 启用/禁用 */

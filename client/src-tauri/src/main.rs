@@ -302,6 +302,7 @@ fn main() {
             commands::window::show_overlay,
             commands::window::hide_overlay,
             commands::window::update_overlay_state,
+            commands::window::overlay_pong,
             // Paste / Context
             commands::paste::paste_text,
             commands::paste::get_probe_result,

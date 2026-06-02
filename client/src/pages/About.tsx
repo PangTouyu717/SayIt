@@ -44,7 +44,7 @@ export default function About() {
                 <span className="rounded-full bg-muted/50 px-2.5 py-0.5 text-xs text-muted-foreground">v{currentVersion}</span>
                 <button
                   type="button"
-                  onClick={() => void shellOpen('https://github.com/crosswk/')}
+                  onClick={() => void shellOpen('https://github.com/crosswk/SayIt')}
                   className="flex h-6 w-6 items-center justify-center rounded-full bg-muted/50 text-muted-foreground transition-colors hover:bg-foreground/15 hover:text-foreground"
                   title="GitHub"
                 >

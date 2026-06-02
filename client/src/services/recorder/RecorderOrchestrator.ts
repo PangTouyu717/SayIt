@@ -316,6 +316,12 @@ export class RecorderOrchestrator {
     this.ensureConnection()
   }
 
+  /** 仅刷新 overlay 显示设置（主题/长度/时长），不触碰录音相关缓存。
+   *  用于外观设置页面，避免改个颜色就触发十几个 IPC 调用。 */
+  async refreshOverlaySettings() {
+    await this.overlayService.refreshSettings()
+  }
+
   // ── State machine ──
 
   private transition(to: RecorderState): boolean {
