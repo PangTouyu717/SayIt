@@ -64,6 +64,7 @@ pub async fn transcribe(
     audio_pcm_b64: &str,
     _sample_rate: u32,
     config: &AsrProviderConfig,
+    hotwords: &[String],
 ) -> Result<AsrResult, String> {
     let pcm = base64::engine::general_purpose::STANDARD
         .decode(audio_pcm_b64)
@@ -77,7 +78,12 @@ pub async fn transcribe(
     }
 
     let model = get_model(config);
-    let instructions = get_instructions(config);
+    let mut instructions = get_instructions(config);
+    // 热词上下文偏置：追加到 system instructions
+    if let Some(ctx) = super::asr_qwen::build_hotword_context_text(hotwords) {
+        instructions.push_str("\n\n请特别注意以下专业术语/词汇的识别：");
+        instructions.push_str(&ctx);
+    }
     let url = ws_url(&model);
 
     // 构建 WebSocket 请求

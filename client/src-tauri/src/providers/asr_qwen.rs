@@ -6,6 +6,25 @@ use std::time::Instant;
 
 const API_URL: &str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
 
+/// 将热词列表拼接为千问 ASR 的上下文偏置文本。
+///
+/// Qwen3-ASR 支持通过上下文文本（context/corpus）提升专业术语、人名等识别准确率，
+/// 最多 10000 tokens。非流式接口放在 system 消息文本里，实时接口放在
+/// session.input_audio_transcription.corpus.text 里。返回去重后用顿号拼接的词表。
+pub fn build_hotword_context_text(hotwords: &[String]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let words: Vec<&str> = hotwords
+        .iter()
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .filter(|w| seen.insert(w.to_string()))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(words.join("、"))
+}
+
 fn pcm_to_wav(pcm: &[u8], sr: u32) -> Vec<u8> {
     let ds = pcm.len() as u32;
     let mut w = Vec::with_capacity(44 + pcm.len());
@@ -29,6 +48,7 @@ pub async fn transcribe(
     audio_pcm_b64: &str,
     sample_rate: u32,
     config: &AsrProviderConfig,
+    hotwords: &[String],
 ) -> Result<AsrResult, String> {
     let pcm = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD, audio_pcm_b64,
@@ -42,11 +62,14 @@ pub async fn transcribe(
     let wav_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wav);
     let data_url = format!("data:audio/wav;base64,{}", wav_b64);
 
+    // 热词上下文偏置：放入 system 消息文本（Qwen3-ASR 通过上下文提升术语识别）
+    let system_text = build_hotword_context_text(hotwords).unwrap_or_default();
+
     let body = serde_json::json!({
         "model": "qwen3-asr-flash",
         "input": {
             "messages": [
-                { "role": "system", "content": [{ "text": "" }] },
+                { "role": "system", "content": [{ "text": system_text }] },
                 { "role": "user", "content": [{ "audio": data_url }] }
             ]
         },

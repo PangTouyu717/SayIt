@@ -146,6 +146,7 @@ export class CloudAPIProvider implements TranscriptionProvider {
         addRuntimeEvent('info', 'cloud_api', '千问流式：建立连接')
         await invoke('qwen_stream_open', {
           config: { provider: 'qwen', api_key: asrApiKey, app_id: '' },
+          hotwords: this.startOpts?.hotwords ?? [],
         })
         this.qwenStreamReady = true
         addRuntimeEvent('info', 'cloud_api', '千问流式：连接就绪')

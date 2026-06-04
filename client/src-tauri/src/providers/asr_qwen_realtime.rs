@@ -17,8 +17,10 @@ static SESSION: once_cell::sync::Lazy<Arc<Mutex<Option<WsStream>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 /// 打开千问实时 ASR 会话
+///
+/// hotwords：热词列表，通过 session.input_audio_transcription.corpus.text 上下文偏置（最多 10000 tokens）
 #[tauri::command]
-pub async fn qwen_stream_open(config: AsrProviderConfig) -> Result<(), String> {
+pub async fn qwen_stream_open(config: AsrProviderConfig, hotwords: Option<Vec<String>>) -> Result<(), String> {
     // 关闭旧会话
     {
         let mut session = SESSION.lock().await;
@@ -46,6 +48,16 @@ pub async fn qwen_stream_open(config: AsrProviderConfig) -> Result<(), String> {
         .map_err(|e| format!("WebSocket 连接失败: {}", e))?;
 
     // 发送 session.update 配置
+    let mut input_audio_transcription = serde_json::json!({
+        "language": "zh"
+    });
+    // 热词上下文偏置（如果有）
+    if let Some(words) = &hotwords {
+        if let Some(ctx) = super::asr_qwen::build_hotword_context_text(words) {
+            input_audio_transcription["corpus"] = serde_json::json!({ "text": ctx });
+        }
+    }
+
     let session_update = serde_json::json!({
         "event_id": "init_session",
         "type": "session.update",
@@ -53,9 +65,7 @@ pub async fn qwen_stream_open(config: AsrProviderConfig) -> Result<(), String> {
             "modalities": ["text"],
             "input_audio_format": "pcm",
             "sample_rate": 16000,
-            "input_audio_transcription": {
-                "language": "zh"
-            },
+            "input_audio_transcription": input_audio_transcription,
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.0,
