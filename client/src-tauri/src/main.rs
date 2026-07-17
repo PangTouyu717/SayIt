@@ -404,6 +404,8 @@ fn main() {
             commands::shortcuts::shortcuts_changed,
             commands::shortcuts::test_shortcut,
             commands::shortcuts::set_ptt_lab_config,
+            commands::shortcuts::begin_mouse_shortcut_capture,
+            commands::shortcuts::end_mouse_shortcut_capture,
             // Export
             commands::export::save_text_export,
             commands::export::save_export_bundle,

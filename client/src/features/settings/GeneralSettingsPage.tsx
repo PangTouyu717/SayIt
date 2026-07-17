@@ -160,8 +160,8 @@ export default function GeneralSettingsPage() {
           <CardContent className="p-6">
             <h2 className="mb-4 text-lg font-semibold">键盘快捷键</h2>
             <div className="space-y-4">
-              <ComboShortcutInput value={handsFreeKey} onChange={handleHandsFreeChange} label="免提模式" description="按一次开始，再按一次结束，支持单键或组合键" />
-              <PTTShortcutInput value={pttKey} onChange={handlePTTChange} label="按住说话" description="按住按键开始录音，松开结束，支持单个按键" />
+              <ComboShortcutInput value={handsFreeKey} onChange={handleHandsFreeChange} label="免提模式" description="按一次开始，再按一次结束，支持单键、组合键或鼠标侧键" />
+              <PTTShortcutInput value={pttKey} onChange={handlePTTChange} label="按住说话" description="按住按键开始录音，松开结束，支持单个按键或鼠标侧键" />
             </div>
           </CardContent>
         </Card>

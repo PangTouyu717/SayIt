@@ -239,6 +239,16 @@ export function testShortcut(accelerator: string) {
   return invoke<boolean>('test_shortcut', { accelerator })
 }
 
+/** 开始鼠标侧键录制捕获：底层鼠标钩子会吞掉下一个侧键并通过 mouse-shortcut-captured 回报。 */
+export function beginMouseShortcutCapture() {
+  return invoke('begin_mouse_shortcut_capture').catch(() => {})
+}
+
+/** 结束鼠标侧键录制捕获（录制结束/取消时调用）。 */
+export function endMouseShortcutCapture() {
+  return invoke('end_mouse_shortcut_capture').catch(() => {})
+}
+
 // ─── System ───
 
 export function getAutoLaunch() {
@@ -357,6 +367,11 @@ export function onPTTTimeoutWarning(cb: (data?: unknown) => void) {
 
 export function onToggleHandsFree(cb: (data?: unknown) => void) {
   const unlisten = listen<unknown>('toggle-hands-free', (event) => cb(event.payload))
+  return () => { unlisten.then((fn) => fn()) }
+}
+
+export function onMouseShortcutCaptured(cb: (data: { setting: string; vk: number }) => void) {
+  const unlisten = listen<{ setting: string; vk: number }>('mouse-shortcut-captured', (event) => cb(event.payload))
   return () => { unlisten.then((fn) => fn()) }
 }
 

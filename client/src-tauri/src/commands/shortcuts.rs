@@ -119,6 +119,20 @@ pub fn test_shortcut(
     Ok(available)
 }
 
+/// 打开鼠标侧键"录制捕获"模式：设置页开始录制快捷键时调用。开启后底层鼠标钩子会
+/// 把下一个侧键按下吞掉（避免 webview 把它当"后退"导航）并通过 `mouse-shortcut-captured`
+/// 事件回报给前端用于绑定。
+#[tauri::command]
+pub fn begin_mouse_shortcut_capture() {
+    crate::keyboard::set_mouse_shortcut_capture(true);
+}
+
+/// 关闭鼠标侧键录制捕获模式：录制结束/取消时调用。
+#[tauri::command]
+pub fn end_mouse_shortcut_capture() {
+    crate::keyboard::set_mouse_shortcut_capture(false);
+}
+
 /// PTT Lab: start/stop a dedicated keyboard hook for the lab test key (right Ctrl).
 /// Completely independent from the main PTT hook — does not interfere with recording.
 #[tauri::command]

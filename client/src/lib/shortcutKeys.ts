@@ -36,6 +36,12 @@ export const SINGLE_KEYS: SingleKeyDef[] = [
   { setting: 'Pause', vk: 0x13, label: 'Pause' },
   { setting: 'ScrollLock', vk: 0x91, label: 'ScrollLock' },
   { setting: 'Insert', vk: 0x2d, label: 'Insert' },
+  // 鼠标侧键（原始 XBUTTON，由 Rust 低级鼠标钩子处理）
+  { setting: 'XButton1', vk: 0x05, label: '鼠标侧键1（后退）' },
+  { setting: 'XButton2', vk: 0x06, label: '鼠标侧键2（前进）' },
+  // 浏览器后退/前进键（罗技等改键鼠标常把侧键映射成这个，由键盘钩子处理）
+  { setting: 'BrowserBack', vk: 0xa6, label: '鼠标侧键（后退键）' },
+  { setting: 'BrowserForward', vk: 0xa7, label: '鼠标侧键（前进键）' },
   // 功能键
   { setting: 'F1', vk: 0x70, label: 'F1' },
   { setting: 'F2', vk: 0x71, label: 'F2' },

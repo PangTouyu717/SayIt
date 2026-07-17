@@ -4,7 +4,7 @@
 //! Runs the message loop on a dedicated thread.
 
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{AppHandle, Emitter};
@@ -31,6 +31,26 @@ static HOOK_RUNNING: AtomicBool = AtomicBool::new(false);
 /// reconfigure() 累计调用次数，用于确认"过一段时间失效"是否与设置变更相关。
 static RECONFIGURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ── 侧键"录制捕获"模式 ──
+// 设置页录制快捷键时，前端会打开这个开关。开启后：
+//  - 鼠标钩子把下一个侧键(XBUTTON)按下吞掉并回报，webview 不会当成“后退”导航；
+//  - 键盘钩子把浏览器后退/前进键(0xA6/0xA7，罗技等改键鼠标常把侧键映射成这个)也
+//    吞掉并回报，同时记录捕获期间收到的每个 keydown 原始特征，便于诊断到底发的是啥。
+static SHORTCUT_CAPTURE: AtomicBool = AtomicBool::new(false);
+/// 捕获到侧键 down 后，记住其 vk，好把配对的 up 也一并吞掉（否则可能残留导航）。
+static CONSUME_XUP_VK: AtomicU32 = AtomicU32::new(0);
+
+/// 打开/关闭侧键录制捕获模式（供设置页录制快捷键时调用）。
+pub fn set_mouse_shortcut_capture(on: bool) {
+    SHORTCUT_CAPTURE.store(on, Ordering::SeqCst);
+    // 只在“开始录制”时清零，作为一次干净的起点。
+    // 绝不在“结束录制”时清零——因为捕获到 down 后配对的 up 往往稍晚才到，
+    // 若在结束时就清掉，这个“抬起”就会漏给 webview（后退键会导致页面返回）。
+    if on {
+        CONSUME_XUP_VK.store(0, Ordering::SeqCst);
+    }
+}
+
 // ── 看门狗写日志的节流状态 ──
 // 每 60s 采样一次是廉价的，但没必要每次都写日志：正常时全是同样的正常值，纯噪音。
 // 只在"状态翻转 / 失败计数增加 / 距上次写日志超过心跳间隔"时才落一行。
@@ -53,6 +73,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, TranslateMessage, DispatchMessageW,
     KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_QUIT,
+    MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 /// 单键热键表 —— 单一数据源。
@@ -73,6 +94,12 @@ const SINGLE_KEY_TABLE: &[(&str, u32)] = &[
     ("Pause", 0x13),
     ("ScrollLock", 0x91),
     ("Insert", 0x2D),
+    // 鼠标侧键：走 WH_MOUSE_LL 鼠标钩子（非键盘钩子），vk 用 Windows 的 VK_XBUTTON1/2。
+    ("XButton1", 0x05),
+    ("XButton2", 0x06),
+    // 浏览器后退/前进键：罗技等改键鼠标常把侧键映射成这个（走键盘钩子）。
+    ("BrowserBack", 0xA6),
+    ("BrowserForward", 0xA7),
     ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
     ("F5", 0x74), ("F6", 0x75), ("F7", 0x76), ("F8", 0x77),
     ("F9", 0x78), ("F10", 0x79), ("F11", 0x7A), ("F12", 0x7B),
@@ -93,6 +120,11 @@ fn vk_codes_for_setting(setting: &str) -> Vec<u32> {
 /// Check if a shortcut setting is a single key (handled by hook) vs combo (handled by global_shortcut)
 pub fn is_single_key_setting(setting: &str) -> bool {
     SINGLE_KEY_TABLE.iter().any(|(s, _)| *s == setting)
+}
+
+/// 该设置是否为鼠标侧键（由低级鼠标钩子处理，而非键盘钩子）。
+fn is_mouse_button_setting(setting: &str) -> bool {
+    matches!(setting, "XButton1" | "XButton2")
 }
 
 #[allow(dead_code)]
@@ -148,6 +180,8 @@ enum HookAction {
     PttUp { vk: u32 },
     HfToggle { vk: u32 },
     Diag { vk: u32, msg_name: &'static str, flags: u32, scan_code: u32 },
+    /// 快捷键录制期间捕获到的鼠标侧键（vk=0x05/0x06），用于让设置页绑定侧键。
+    MouseCaptured { vk: u32 },
 }
 
 /// RAII 计时器：测量 `low_level_keyboard_proc` 单次调用耗时，drop 时更新
@@ -324,23 +358,26 @@ impl KeyboardHookManager {
         if let Some(state) = self.shared_state.lock().unwrap().as_ref() {
             if state.ptt_key_down.load(Ordering::SeqCst) {
                 state.ptt_key_down.store(false, Ordering::SeqCst);
-                // 发送合成的 keyup 事件，让 Windows 释放修饰键
-                for &vk in &state.ptt_vk_codes {
-                    unsafe {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::*;
-                        let mut input = INPUT {
-                            r#type: INPUT_KEYBOARD,
-                            ..std::mem::zeroed()
-                        };
-                        input.Anonymous.ki = KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(vk as u16),
-                            dwFlags: KEYEVENTF_KEYUP,
-                            ..std::mem::zeroed()
-                        };
-                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                // 鼠标侧键不涉及键盘修饰键状态，无需（也不能）补发键盘 keyup。
+                if !is_mouse_button_setting(&state.ptt_setting) {
+                    // 发送合成的 keyup 事件，让 Windows 释放修饰键
+                    for &vk in &state.ptt_vk_codes {
+                        unsafe {
+                            use windows::Win32::UI::Input::KeyboardAndMouse::*;
+                            let mut input = INPUT {
+                                r#type: INPUT_KEYBOARD,
+                                ..std::mem::zeroed()
+                            };
+                            input.Anonymous.ki = KEYBDINPUT {
+                                wVk: VIRTUAL_KEY(vk as u16),
+                                dwFlags: KEYEVENTF_KEYUP,
+                                ..std::mem::zeroed()
+                            };
+                            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                        }
                     }
+                    log::info!("[ptt] sent synthetic keyup on stop to clear modifier state");
                 }
-                log::info!("[ptt] sent synthetic keyup on stop to clear modifier state");
             }
         }
 
@@ -492,6 +529,22 @@ impl KeyboardHookManager {
                             "vk": vk,
                         }));
                     }
+                    HookAction::MouseCaptured { vk } => {
+                        let setting = match vk {
+                            0x05 => "XButton1",
+                            0x06 => "XButton2",
+                            0xA6 => "BrowserBack",
+                            0xA7 => "BrowserForward",
+                            _ => "",
+                        };
+                        crate::commands::system::write_log_line(
+                            &format!("[RUST] [shortcut-capture] mouse side button vk={} setting={}", vk, setting)
+                        );
+                        let _ = dispatch_state.app_handle.emit("mouse-shortcut-captured", serde_json::json!({
+                            "setting": setting,
+                            "vk": vk,
+                        }));
+                    }
                 }
             }
             log::info!("[ptt] dispatcher thread exited");
@@ -533,6 +586,28 @@ impl KeyboardHookManager {
                 None => return,
             };
 
+            // 低级鼠标钩子始终随键盘钩子一起挂上：一是支持侧键做 PTT/免提，二是设置页
+            // 录制侧键时需要靠它在 OS 层把侧键吞掉（否则 webview 会先把侧键当“后退”）。
+            // 它与键盘钩子共用本线程的同一个消息循环；回调对鼠标移动等有最前置的快速放行，
+            // 开销可忽略。只有真正命中侧键（录制捕获 / 已绑为热键）时才会吞事件。
+            let mouse_hook: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> =
+                match SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), None, 0) {
+                    Ok(h) => {
+                        log::info!("SetWindowsHookExW(WH_MOUSE_LL) succeeded: {:?}", h.0);
+                        crate::commands::system::write_log_line(
+                            "[ptt-lifecycle] mouse hook installed (side-button support active)",
+                        );
+                        Some(h)
+                    }
+                    Err(e) => {
+                        log::error!("SetWindowsHookExW(WH_MOUSE_LL) failed: {}", e);
+                        crate::commands::system::write_log_line(&format!(
+                            "[ptt-lifecycle] mouse hook FAILED to install: {}", e,
+                        ));
+                        None
+                    }
+                };
+
             let thread_id = GetCurrentThreadId();
             let _ = tx.send(thread_id);
             log::info!("keyboard hook message loop starting on thread {}", thread_id);
@@ -545,6 +620,9 @@ impl KeyboardHookManager {
 
             log::info!("keyboard hook message loop exited");
             let _ = UnhookWindowsHookEx(hook);
+            if let Some(mh) = mouse_hook {
+                let _ = UnhookWindowsHookEx(mh);
+            }
         }
 
         HOOK_STATE.with(|s| {
@@ -560,6 +638,136 @@ impl KeyboardHookManager {
         let _ = tx.send(0);
         // No-op on non-Windows
     }
+}
+
+/// 低级鼠标钩子回调：只处理鼠标侧键（XButton1/2）的按下/抬起，复用与键盘钩子
+/// 完全相同的 PTT/免提流水线（HookAction -> dispatcher -> emit）。
+///
+/// ⚠️ 性能：WH_MOUSE_LL 会在**每次鼠标移动**都被调用。因此第一件事就是判断
+/// “不是侧键的按下/抬起就立刻放行”，绝不在鼠标移动这条最热的路径上做任何多余的事。
+#[cfg(windows)]
+unsafe extern "system" fn low_level_mouse_proc(
+    n_code: i32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    let msg = w_param.0 as u32;
+
+    // ── 最热路径：移动/滚轮/其它键一律立刻放行，连结构体都不解引用 ──
+    if n_code < 0 || (msg != WM_XBUTTONDOWN && msg != WM_XBUTTONUP) {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
+
+    let ms = &*(l_param.0 as *const MSLLHOOKSTRUCT);
+
+    // 过滤注入（合成）的鼠标事件，只认真实硬件按键。
+    const LLMHF_INJECTED: u32 = 0x00000001;
+    if (ms.flags & LLMHF_INJECTED) != 0 {
+        return CallNextHookEx(None, n_code, w_param, l_param);
+    }
+
+    // 侧键编号在 mouseData 的高 16 位：1=XBUTTON1（后退键） 2=XBUTTON2（前进键）。
+    let xbtn = (ms.mouseData >> 16) & 0xFFFF;
+    let vk: u32 = match xbtn {
+        1 => 0x05, // VK_XBUTTON1
+        2 => 0x06, // VK_XBUTTON2
+        _ => return CallNextHookEx(None, n_code, w_param, l_param),
+    };
+
+    let is_down = msg == WM_XBUTTONDOWN;
+    let is_up = msg == WM_XBUTTONUP;
+
+    // ── 录制捕获模式：把侧键吞掉并回报给设置页，避免 webview 把它当成“后退”导航 ──
+    if SHORTCUT_CAPTURE.load(Ordering::SeqCst) {
+        if is_down {
+            SHORTCUT_CAPTURE.store(false, Ordering::SeqCst);
+            CONSUME_XUP_VK.store(vk, Ordering::SeqCst); // 记住 vk，好把配对的 up 也吞掉
+            HOOK_ACTION_TX.with(|tx| {
+                if let Some(sender) = tx.borrow().as_ref() {
+                    if sender.try_send(HookAction::MouseCaptured { vk }).is_err() {
+                        TRY_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+        return LRESULT(1); // 捕获期间侧键的 down/up 一律吞掉
+    }
+    // 吞掉“捕获到的那次 down”配对的 up，避免残留“后退”导航。
+    if is_up && CONSUME_XUP_VK.load(Ordering::SeqCst) == vk {
+        CONSUME_XUP_VK.store(0, Ordering::SeqCst);
+        return LRESULT(1);
+    }
+
+    let mut consumed = false;
+
+    HOOK_STATE.with(|s| {
+        if let Some(state) = s.borrow().as_ref() {
+            let is_ptt_key = state.ptt_vk_codes.contains(&vk);
+            let is_hf_key = !state.hf_vk_codes.is_empty()
+                && state.hf_vk_codes.contains(&vk)
+                && !is_ptt_key; // 同一键时 PTT 优先
+
+            if is_ptt_key {
+                // 鼠标侧键不涉及键盘修饰键状态，按下和抬起都吞掉，
+                // 避免误触发其它程序的“前进/后退”。
+                consumed = true;
+
+                if is_down
+                    && !state.ptt_key_down.load(Ordering::SeqCst)
+                    && !state.hands_free_active.load(Ordering::SeqCst)
+                {
+                    state.ptt_key_down.store(true, Ordering::SeqCst);
+                    let gen = state.ptt_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    HOOK_ACTION_TX.with(|tx| {
+                        if let Some(sender) = tx.borrow().as_ref() {
+                            if sender.try_send(HookAction::PttDown { vk, gen }).is_err() {
+                                TRY_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+
+                if is_up && state.ptt_key_down.load(Ordering::SeqCst) {
+                    state.ptt_key_down.store(false, Ordering::SeqCst);
+                    if !state.hands_free_active.load(Ordering::SeqCst) {
+                        HOOK_ACTION_TX.with(|tx| {
+                            if let Some(sender) = tx.borrow().as_ref() {
+                                if sender.try_send(HookAction::PttUp { vk }).is_err() {
+                                    TRY_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            if is_hf_key {
+                // 免提：按下即吞，抬起触发 toggle（需先配对过真实按下，防孤儿抬起误触）。
+                if is_down {
+                    consumed = true;
+                    state.hf_key_down.store(true, Ordering::SeqCst);
+                }
+                if is_up {
+                    let had_down = state.hf_key_down.swap(false, Ordering::SeqCst);
+                    if had_down {
+                        consumed = true;
+                        HOOK_ACTION_TX.with(|tx| {
+                            if let Some(sender) = tx.borrow().as_ref() {
+                                if sender.try_send(HookAction::HfToggle { vk }).is_err() {
+                                    TRY_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    if consumed {
+        return LRESULT(1);
+    }
+    CallNextHookEx(None, n_code, w_param, l_param)
 }
 
 #[cfg(windows)]
@@ -594,8 +802,32 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let kb_flags = kb.flags.0;
         let kb_scan_code = kb.scanCode;
 
-        let is_synthetic = (kb.flags.0 & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0
-            || kb.scanCode == 0;
+        let is_kdown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+
+        // ── 侧键录制捕获（键盘侧）：必须放在下面的“幻影过滤”之前，因为罗技等改键鼠标
+        //    发出的浏览器后退/前进键通常带“注入”标志，会被幻影过滤器直接丢掉。 ──
+        if SHORTCUT_CAPTURE.load(Ordering::SeqCst) {
+            // 浏览器后退/前进键 → 作为侧键绑定，并吞掉避免 webview 后退/前进导航。
+            if vk == 0xA6 || vk == 0xA7 {
+                if is_kdown {
+                    SHORTCUT_CAPTURE.store(false, Ordering::SeqCst);
+                    HOOK_ACTION_TX.with(|tx| {
+                        if let Some(sender) = tx.borrow().as_ref() {
+                            let _ = sender.try_send(HookAction::MouseCaptured { vk });
+                        }
+                    });
+                }
+                return LRESULT(1);
+            }
+        }
+
+        // 幻影过滤：注入或 scanCode==0 视为系统合成键，放行、不当作用户按键。
+        // 例外：浏览器后退/前进（0xA6/0xA7）常由鼠标驱动“注入”，不能按幻影丢弃——
+        // 否则绑成侧键后按下不生效；它们不会是“幻影 Alt”，放行进入匹配是安全的。
+        let is_synthetic = ((kb.flags.0 & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0
+            || kb.scanCode == 0)
+            && vk != 0xA6
+            && vk != 0xA7;
         if is_synthetic {
             return CallNextHookEx(None, n_code, w_param, l_param);
         }

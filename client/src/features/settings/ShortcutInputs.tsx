@@ -35,8 +35,22 @@ export function PTTShortcutInput({
   useEffect(() => {
     if (!recording) return
     window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [recording, handleKeyDown])
+    // 鼠标侧键无法靠 webview 事件可靠捕获（会被当成“后退”导航），改由 Rust 底层鼠标钩子
+    // 在 OS 层捕获并吞掉，再通过事件回报要绑定的侧键。
+    bridge.beginMouseShortcutCapture()
+    const off = bridge.onMouseShortcutCaptured(({ setting }) => {
+      if (!setting) return
+      setRecording(false)
+      // 侧键：延迟提交（延迟触发钩子重配），让本次物理“松开”先被当前钩子吞掉。
+      // 否则重配钩子的空档期会把这次“抬起”漏给 webview——后退键会导致页面返回。
+      window.setTimeout(() => onChange(setting), 400)
+    })
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      bridge.endMouseShortcutCapture()
+      off()
+    }
+  }, [recording, handleKeyDown, onChange])
 
   const displayName = value ? getSingleKeyDisplay(value) : '未设置'
 
@@ -150,11 +164,28 @@ export function ComboShortcutInput({
 
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('keyup', handleKeyUp)
+    // 仅单键模式接受鼠标侧键（comboOnly 只收组合键）；侧键由 Rust 底层鼠标钩子捕获后回报。
+    let off: (() => void) | undefined
+    if (!comboOnly) {
+      bridge.beginMouseShortcutCapture()
+      off = bridge.onMouseShortcutCaptured(({ setting }) => {
+        if (!setting || committingRef.current) return
+        committingRef.current = true
+        setRecording(false)
+        setTempValue('')
+        // 见 PTT 处说明：延迟提交，避免重配钩子的空档期把侧键“抬起”漏给 webview。
+        window.setTimeout(() => onChange(setting), 400)
+      })
+    }
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
+      if (!comboOnly) {
+        bridge.endMouseShortcutCapture()
+        off?.()
+      }
     }
-  }, [recording, handleKeyDown, handleKeyUp])
+  }, [recording, handleKeyDown, handleKeyUp, comboOnly, onChange])
 
   // 显示：单键用 getSingleKeyDisplay，组合键用 displayAccelerator
   const isSingleKey = resolveSingleKeyShortcut(tempValue || value) !== undefined
