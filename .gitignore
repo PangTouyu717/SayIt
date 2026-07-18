@@ -52,3 +52,9 @@ Thumbs.db
 # ── Logs & runtime ──
 *.log
 runtime/
+
+# ── MemSearch ──
+.memsearch/
+
+# ── Build output ──
+Saylt/
