@@ -10,6 +10,7 @@ pub mod asr_doubao_realtime;
 pub mod asr_qwen;
 pub mod asr_qwen_omni;
 pub mod asr_mimo;
+pub mod asr_siliconflow;
 pub mod asr_qwen_realtime;
 pub mod doubao_protocol;
 pub mod registry;

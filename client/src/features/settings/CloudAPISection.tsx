@@ -16,6 +16,7 @@ const ASR_PROVIDERS = [
   { value: 'qwen_omni_35_plus', label: '千问 3.5 Omni Plus（qwen3.5-omni-plus，ASR+AI）' },
   { value: 'qwen_omni_35_flash', label: '千问 3.5 Omni Flash（qwen3.5-omni-flash，ASR+AI）' },
   { value: 'mimo', label: '小米 MiMo（mimo-v2.5-asr）' },
+  { value: 'siliconflow', label: '硅基流动（SiliconFlow）' },
 ]
 
 interface TestResult {
@@ -74,6 +75,7 @@ const OMNI_PROMPT_PRESETS = [
 function asrKeyGroup(provider: string): string {
   if (provider === 'doubao_v2' || provider === 'doubao') return 'doubao'
   if (provider === 'mimo') return 'mimo' // 小米 MiMo 用独立 api-key
+  if (provider === 'siliconflow') return 'siliconflow' // 硅基流动用独立 api-key
   return 'qwen' // qwen, qwen_omni_flash, qwen_omni_plus 都用百炼 key
 }
 
@@ -264,7 +266,7 @@ export default function CloudAPISection() {
                   <PasswordInput
                     value={asrApiKey}
                     onChange={setAsrApiKey}
-                    placeholder={asrProvider === 'doubao_v2' ? '输入火山引擎 Access Token' : asrProvider === 'mimo' ? '输入小米 MiMo API Key' : '输入百炼平台 API Key'}
+                    placeholder={asrProvider === 'doubao_v2' ? '输入火山引擎 Access Token' : asrProvider === 'mimo' ? '输入小米 MiMo API Key' : asrProvider === 'siliconflow' ? '输入硅基流动 API Key（sk-...）' : '输入百炼平台 API Key'}
                     className={inputClass}
                   />
                 </div>
